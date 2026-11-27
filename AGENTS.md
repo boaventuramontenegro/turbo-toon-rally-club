@@ -37,3 +37,5 @@ use the editor.
 - Settings, keymaps, profiles and saved tracks are per-device localStorage (`tt.*` keys); published tracks go to `public.community_tracks` (anon read/insert only). Why: no accounts in the game.
 - Obstacles move deterministically from race time so every client sees the same positions without syncing them.
 - Dev-only debug hook: `window.__race` (set in RaceView when `import.meta.env.DEV`) exposes the running Race for browser checks.
+- Personalization uses the existing PlayerSetup on every viewport; change only responsive sizing and grid placement. Why: desktop and mobile must expose the same options.
+- Audio uses CDN music streams and a decoded PCM effects bank through separate Web Audio music/effects buses, with compressor/headroom and speed-driven engine loops. Why: avoid distorted overlapping oscillator bursts and keep independent volume control.

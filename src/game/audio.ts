@@ -1,127 +1,190 @@
-// Procedural Web Audio: engine hum per kart, sound effects and a per-track music sequencer.
-import type { ThemeDef } from "./data";
+import menuAsset from "@/assets/audio/menu.mp3.asset.json";
+import selectionAsset from "@/assets/audio/selection.mp3.asset.json";
+import raceAsset from "@/assets/audio/race.mp3.asset.json";
+import effectsAsset from "@/assets/audio/effects.wav.asset.json";
+import { AUDIO_CLIPS } from "./audio-clips";
 
+export type AudioScene = "menu" | "selection" | "race";
+type ClipName = keyof typeof AUDIO_CLIPS;
+type EngineVoice = { base: number; speed: number; audible: number; boost: boolean; drifting: boolean; source?: AudioBufferSourceNode; gain?: GainNode; tire?: AudioBufferSourceNode; tireGain?: GainNode };
+const MUSIC = { menu: menuAsset.url, selection: selectionAsset.url, race: raceAsset.url };
+const MIX: Partial<Record<ClipName, number>> = { click: .14, beep: .34, go: .38, bump: .28, hit: .36, crate: .3, land: .3, explode: .38, drift: .13, boost: .3, nitro: .32, win: .45, lose: .4, pickup: .3 };
+export const safeVolume = (value: number) => Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
+export const engineRate = (speed: number, boost: boolean) => .72 + Math.max(0, Math.min(1.3, speed)) * 1.65 + (boost ? .16 : 0);
+
+/** Sample playback only: separate buses, smooth gain changes, voice limits and master headroom. */
 class AudioEngine {
   ctx: AudioContext | null = null;
-  music!: GainNode; sfx!: GainNode; master!: GainNode;
-  musicVol = 0.5; sfxVol = 0.7;
-  private noiseBuf: AudioBuffer | null = null;
-  private seqTimer: number | null = null;
-  private engines = new Map<number, { o: OscillatorNode; o2: OscillatorNode; g: GainNode; f: BiquadFilterNode }>();
+  music: GainNode | null = null;
+  sfx: GainNode | null = null;
+  master: GainNode | null = null;
+  musicVol = .5; sfxVol = .7;
+  private engineBus: GainNode | null = null;
+  private bank: AudioBuffer | null = null;
+  private loading: Promise<void> | null = null;
+  private scene: AudioScene = "menu";
+  private tracks: { media: HTMLAudioElement; gain: GainNode }[] = [];
+  private activeTrack = -1;
+  private engines = new Map<number, EngineVoice>();
+  private voices = new Set<AudioBufferSourceNode>();
+  private lastPlay = new Map<string, number>();
+  private paused = false;
 
   init() {
-    if (this.ctx || typeof window === "undefined") { void this.ctx?.resume(); return; }
-    const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    this.ctx = new Ctx();
-    this.master = this.ctx.createGain(); this.master.connect(this.ctx.destination);
-    this.music = this.ctx.createGain(); this.music.connect(this.master);
-    this.sfx = this.ctx.createGain(); this.sfx.connect(this.master);
-    this.setVolumes(this.musicVol, this.sfxVol);
-    const len = this.ctx.sampleRate;
-    this.noiseBuf = this.ctx.createBuffer(1, len, len);
-    const d = this.noiseBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    if (typeof window === "undefined") return;
+    if (!this.ctx) {
+      const Ctx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!Ctx) return;
+      const c = new Ctx(); this.ctx = c;
+      const compressor = c.createDynamicsCompressor();
+      compressor.threshold.value = -12; compressor.knee.value = 12;
+      compressor.ratio.value = 6; compressor.attack.value = .003; compressor.release.value = .18;
+      this.master = c.createGain(); this.master.gain.value = .65;
+      this.master.connect(compressor); compressor.connect(c.destination);
+      this.music = c.createGain(); this.sfx = c.createGain(); this.engineBus = c.createGain();
+      this.music.connect(this.master); this.sfx.connect(this.master); this.engineBus.connect(this.sfx);
+      this.engineBus.gain.value = .65;
+      for (let i = 0; i < 2; i++) {
+        const media = new Audio(); media.crossOrigin = "anonymous"; media.preload = "metadata";
+        const gain = c.createGain(); gain.gain.value = 0;
+        c.createMediaElementSource(media).connect(gain); gain.connect(this.music);
+        media.addEventListener("timeupdate", () => {
+          if (this.tracks[this.activeTrack]?.media === media && media.duration - media.currentTime < 1.2 && !media.paused) this.switchMusic();
+        });
+        // Fallback if a browser skips timeupdate while a tab is in the background.
+        media.addEventListener("ended", () => { if (this.tracks[this.activeTrack]?.media === media) this.switchMusic(); });
+        this.tracks.push({ media, gain });
+      }
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) { this.tracks.forEach((t) => t.media.pause()); void c.suspend(); }
+        else this.unlock();
+      });
+      this.setVolumes(this.musicVol, this.sfxVol);
+      this.preload();
+    }
+    this.preload(); this.unlock();
   }
-  setVolumes(m: number, s: number) {
-    this.musicVol = m; this.sfxVol = s;
-    if (!this.ctx) return;
-    this.music.gain.value = m * 0.35; this.sfx.gain.value = s * 0.6;
+
+  unlock() {
+    const c = this.ctx; if (!c || document.hidden) return;
+    void c.resume().then(() => {
+      if (this.activeTrack < 0) this.switchMusic();
+      else {
+        const t = this.tracks[this.activeTrack];
+        if (t?.media.paused) void t.media.play().catch(() => { /* retry on the next user gesture */ });
+      }
+    }).catch(() => { /* Browser requires a user gesture. */ });
   }
-  private tone(freq: number, dur: number, type: OscillatorType = "square", vol = 0.3, slide = 0, when = 0, dest?: AudioNode) {
+
+  private smooth(node: GainNode | null | undefined, value: number, seconds = .04) {
+    const c = this.ctx; if (!node || !c) return;
+    node.gain.setTargetAtTime(value, c.currentTime, seconds);
+  }
+  setVolumes(music: number, effects: number) {
+    this.musicVol = safeVolume(music); this.sfxVol = safeVolume(effects);
+    this.smooth(this.music, this.musicVol * .48);
+    this.smooth(this.sfx, this.sfxVol * .65);
+  }
+  setScene(scene: AudioScene) {
+    if (scene === this.scene && this.activeTrack >= 0) return;
+    this.scene = scene;
+    if (this.ctx) this.switchMusic();
+  }
+  private switchMusic() {
     const c = this.ctx; if (!c) return;
-    const t = c.currentTime + when;
-    const o = c.createOscillator(), g = c.createGain();
-    o.type = type; o.frequency.setValueAtTime(freq, t);
-    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), t + dur);
-    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    o.connect(g); g.connect(dest ?? this.sfx); o.start(t); o.stop(t + dur + 0.02);
+    const old = this.tracks[this.activeTrack];
+    const index = this.activeTrack === 0 ? 1 : 0;
+    const next = this.tracks[index]; if (!next) return;
+    this.activeTrack = index;
+    next.media.pause(); next.media.src = MUSIC[this.scene]; next.media.currentTime = 0;
+    next.gain.gain.cancelScheduledValues(c.currentTime); next.gain.gain.setValueAtTime(0, c.currentTime);
+    void next.media.play().then(() => {
+      if (this.tracks[this.activeTrack] !== next) return;
+      this.smooth(next.gain, 1, .3);
+      if (old) this.smooth(old.gain, 0, .3);
+    }).catch(() => { /* unlock() retries on tap/key. */ });
   }
-  private noise(dur: number, vol = 0.3, freq = 1200, when = 0, dest?: AudioNode, q = 1) {
-    const c = this.ctx; if (!c || !this.noiseBuf) return;
-    const t = c.currentTime + when;
-    const s = c.createBufferSource(); s.buffer = this.noiseBuf;
-    const f = c.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = freq; f.Q.value = q;
-    const g = c.createGain(); g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-    s.connect(f); f.connect(g); g.connect(dest ?? this.sfx); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+  private preload() {
+    if (this.loading || !this.ctx) return;
+    const c = this.ctx;
+    this.loading = fetch(effectsAsset.url).then((r) => {
+      if (!r.ok) throw new Error("Sound bank unavailable");
+      return r.arrayBuffer();
+    }).then((data) => c.decodeAudioData(data)).then((bank) => {
+      this.bank = bank;
+      for (const voice of this.engines.values()) this.attachEngine(voice);
+    }).catch(() => { this.loading = null; });
   }
   play(name: string) {
-    if (!this.ctx) return;
-    switch (name) {
-      case "beep": this.tone(440, 0.18, "square", 0.25); break;
-      case "go": this.tone(880, 0.5, "square", 0.3); break;
-      case "pickup": [0, 0.05, 0.1].forEach((w, i) => this.tone(600 + i * 250, 0.08, "square", 0.15, 0, w)); break;
-      case "nitro": case "boost": this.noise(0.6, 0.35, 800, 0, undefined, 0.6); this.tone(200, 0.5, "sawtooth", 0.15, 600); break;
-      case "shield": this.tone(300, 0.4, "sine", 0.3, 500); this.tone(450, 0.4, "triangle", 0.2, 700, 0.05); break;
-      case "missile": this.noise(0.4, 0.3, 2500); this.tone(900, 0.4, "sawtooth", 0.1, -600); break;
-      case "drop": this.tone(200, 0.15, "square", 0.2, -100); break;
-      case "hit": this.noise(0.35, 0.5, 400, 0, undefined, 0.5); this.tone(120, 0.3, "square", 0.3, -80); break;
-      case "explode": this.noise(0.7, 0.6, 250, 0, undefined, 0.4); this.tone(80, 0.6, "sawtooth", 0.3, -50); break;
-      case "bump": this.tone(90, 0.12, "square", 0.3, -40); this.noise(0.1, 0.2, 300); break;
-      case "crate": this.noise(0.25, 0.4, 900); this.tone(160, 0.15, "square", 0.2, -60); break;
-      case "heal": [0, 0.08, 0.16].forEach((w, i) => this.tone(523 * (1 + i * 0.26), 0.15, "triangle", 0.2, 0, w)); break;
-      case "zap": this.noise(0.3, 0.4, 3000, 0, undefined, 2); this.tone(1500, 0.3, "sawtooth", 0.15, -1200); break;
-      case "freeze": this.tone(1200, 0.4, "sine", 0.2, 800); this.noise(0.4, 0.2, 5000); break;
-      case "spin": this.tone(500, 0.6, "triangle", 0.2, -350); break;
-      case "drift": this.noise(0.15, 0.08, 1800, 0, undefined, 3); break;
-      case "miniturbo": this.tone(700, 0.2, "square", 0.15, 400); this.noise(0.3, 0.2, 1000); break;
-      case "jump": this.tone(300, 0.25, "square", 0.15, 300); break;
-      case "land": this.tone(110, 0.1, "square", 0.25, -40); break;
-      case "trick": this.tone(660, 0.1, "square", 0.15); this.tone(990, 0.12, "square", 0.15, 0, 0.08); break;
-      case "lap": [0, 0.1, 0.2].forEach((w, i) => this.tone(660 + i * 110, 0.12, "square", 0.2, 0, w)); break;
-      case "ability": this.tone(220, 0.5, "sawtooth", 0.2, 880); this.tone(330, 0.5, "square", 0.1, 990, 0.05); break;
-      case "click": this.tone(1000, 0.04, "square", 0.08); break;
-      case "win": [523, 659, 784, 1046, 784, 1046].forEach((f, i) => this.tone(f, 0.22, "square", 0.2, 0, i * 0.13)); break;
-      case "lose": [392, 349, 311, 262].forEach((f, i) => this.tone(f, 0.3, "triangle", 0.25, 0, i * 0.2)); break;
-      case "ko": this.tone(400, 0.8, "sawtooth", 0.3, -350); this.noise(0.8, 0.4, 300); break;
-    }
+    const c = this.ctx;
+    if (!c || !this.sfx || !this.bank || !(name in AUDIO_CLIPS) || c.state !== "running") return;
+    const id = name as ClipName;
+    // Drift is a continuous tire layer now, not randomly retriggered bursts.
+    if (id === "drift" || id.startsWith("engine-")) return;
+    const group = ["hit", "bump", "crate", "explode"].includes(id) ? "impact" : id;
+    const cooldown = group === "impact" ? .1 : id === "boost" ? .55 : .08;
+    if (c.currentTime - (this.lastPlay.get(group) ?? -10) < cooldown || this.voices.size >= 12) return;
+    this.lastPlay.set(group, c.currentTime);
+    const source = c.createBufferSource(), gain = c.createGain(), clip = AUDIO_CLIPS[id];
+    source.buffer = this.bank; gain.gain.value = MIX[id] ?? .32;
+    source.connect(gain); gain.connect(this.sfx); this.voices.add(source);
+    source.onended = () => { this.voices.delete(source); source.disconnect(); gain.disconnect(); };
+    source.start(0, clip.offset, clip.duration);
+  }
+  private loopClip(id: ClipName, gain: GainNode) {
+    const c = this.ctx; if (!c || !this.bank) return;
+    const clip = AUDIO_CLIPS[id], source = c.createBufferSource();
+    source.buffer = this.bank; source.loop = true;
+    source.loopStart = clip.offset; source.loopEnd = clip.offset + clip.duration;
+    source.connect(gain); source.start(0, clip.offset);
+    return source;
   }
   engineStart(id: number, base: number) {
-    const c = this.ctx; if (!c || this.engines.has(id)) return;
-    const o = c.createOscillator(), o2 = c.createOscillator(), g = c.createGain(), f = c.createBiquadFilter();
-    o.type = "sawtooth"; o2.type = "square"; o.frequency.value = base; o2.frequency.value = base / 2;
-    f.type = "lowpass"; f.frequency.value = 600; g.gain.value = 0;
-    o.connect(f); o2.connect(f); f.connect(g); g.connect(this.sfx); o.start(); o2.start();
-    this.engines.set(id, { o, o2, g, f });
+    if (this.engines.has(id)) return;
+    const voice: EngineVoice = { base, speed: 0, audible: .8, boost: false, drifting: false };
+    this.engines.set(id, voice); this.attachEngine(voice);
   }
-  engineSet(id: number, speed01: number, boost: boolean, base: number) {
-    const e = this.engines.get(id); if (!e || !this.ctx) return;
-    const t = this.ctx.currentTime;
-    const fr = base + speed01 * base * 2.2 + (boost ? 40 : 0);
-    e.o.frequency.setTargetAtTime(fr, t, 0.05); e.o2.frequency.setTargetAtTime(fr / 2, t, 0.05);
-    e.f.frequency.setTargetAtTime(400 + speed01 * 1400, t, 0.05);
-    e.g.gain.setTargetAtTime(0.035 + speed01 * 0.05, t, 0.08);
+  private attachEngine(voice: EngineVoice) {
+    const c = this.ctx; if (!c || !this.bank || !this.engineBus || voice.source) return;
+    const gain = c.createGain(), tireGain = c.createGain(), filter = c.createBiquadFilter();
+    gain.gain.value = 0; tireGain.gain.value = 0;
+    filter.type = "lowpass"; filter.frequency.value = 2400; filter.Q.value = .5;
+    gain.connect(filter); filter.connect(this.engineBus); tireGain.connect(this.engineBus);
+    const source = this.loopClip(voice.base < 50 ? "engine-truck" : voice.base > 70 ? "engine-moto" : "engine-kart", gain);
+    const tire = this.loopClip("drift", tireGain);
+    if (source) voice.source = source;
+    if (tire) voice.tire = tire;
+    voice.gain = gain; voice.tireGain = tireGain;
+    this.updateEngine(voice);
+  }
+  engineSet(id: number, speed: number, boost: boolean, base: number, drifting = false, audible = .8) {
+    const voice = this.engines.get(id); if (!voice) return;
+    voice.speed = Math.max(0, Math.min(1.3, speed)); voice.boost = boost; voice.base = base;
+    voice.drifting = drifting; voice.audible = safeVolume(audible);
+    this.updateEngine(voice);
+  }
+  private updateEngine(voice: EngineVoice) {
+    const c = this.ctx; if (!c) return;
+    voice.source?.playbackRate.setTargetAtTime(engineRate(voice.speed, voice.boost), c.currentTime, .09);
+    const headroom = 1 / Math.sqrt(Math.max(1, this.engines.size));
+    this.smooth(voice.gain, (.08 + voice.speed * .13) * voice.audible * headroom, .08);
+    this.smooth(voice.tireGain, voice.drifting ? .18 * Math.min(1, voice.speed) * voice.audible * headroom : 0, .06);
+  }
+  setRacePaused(paused: boolean) {
+    this.paused = paused;
+    this.smooth(this.engineBus, paused ? 0 : .65, .08);
   }
   engineStopAll() {
-    for (const e of this.engines.values()) { try { e.g.gain.value = 0; e.o.stop(); e.o2.stop(); } catch { /* already stopped */ } }
-    this.engines.clear();
+    const c = this.ctx;
+    for (const voice of this.engines.values()) {
+      this.smooth(voice.gain, 0, .015); this.smooth(voice.tireGain, 0, .015);
+      voice.source?.stop((c?.currentTime ?? 0) + .1); voice.tire?.stop((c?.currentTime ?? 0) + .1);
+    }
+    this.engines.clear(); this.lastPlay.clear();
+    this.setRacePaused(false);
   }
-  stopMusic() { if (this.seqTimer !== null) { clearInterval(this.seqTimer); this.seqTimer = null; } }
-  startMusic(m: ThemeDef["music"], intensity = 1) {
-    this.init(); this.stopMusic();
-    const c = this.ctx; if (!c) return;
-    const spb = 60 / m.bpm / 2; // eighth notes
-    let step = 0; let next = c.currentTime + 0.1;
-    const midi = (n: number) => 440 * Math.pow(2, (n - 69) / 12);
-    const prog = [0, 3, 4, 2];
-    const r = (k: number) => ((k * 9301 + 49297) % 233280) / 233280;
-    const tick = () => {
-      while (next < c.currentTime + 0.25) {
-        const when = next - c.currentTime;
-        const bar = Math.floor(step / 8) % 4, s = step % 8;
-        const chord = prog[bar]!;
-        const deg = (d: number) => { const sc = m.scale; const o = Math.floor(d / sc.length); return m.root + sc[((d % sc.length) + sc.length) % sc.length]! + o * 12; };
-        if (s % 2 === 0) this.tone(midi(deg(chord) - 12), spb * 1.6, "triangle", 0.35, 0, when, this.music);
-        if (intensity > 0) { const n = deg(chord + [0, 2, 4, 2, 5, 4, 2, 4][s]! + (r(step) > 0.8 ? 1 : 0)); this.tone(midi(n + 12), spb * 0.9, m.wave, 0.07, 0, when, this.music); }
-        if (s === 0 || s === 4) this.tone(110, 0.15, "sine", 0.6, -70, when, this.music);
-        if (s === 2 || s === 6) this.noise(0.12, 0.25, 1800, when, this.music);
-        this.noise(0.03, 0.1, 7000, when, this.music, 2);
-        if (s === 7 && bar === 3) this.tone(midi(deg(chord + 7) + 12), spb * 2, "square", 0.05, 0, when, this.music);
-        next += spb; step++;
-      }
-    };
-    tick();
-    this.seqTimer = window.setInterval(tick, 50);
+  diagnostics() {
+    return { context: this.ctx?.state ?? "uninitialized", scene: this.scene, loadedEffects: Boolean(this.bank), activeVoices: this.voices.size, engines: this.engines.size, paused: this.paused, musicPlaying: this.tracks[this.activeTrack]?.media.paused === false, musicVolume: this.musicVol, effectsVolume: this.sfxVol };
   }
 }
-
 export const audio = new AudioEngine();

@@ -13,6 +13,8 @@ import { Lobby, OnlineMenu } from "./Online";
 import { PlayerSetup } from "./PlayerSetup";
 import { RaceView } from "./RaceView";
 import { cn } from "@/lib/utils";
+import { audio } from "../audio";
+import { SoundControls } from "./SoundControls";
 
 type ModeId = (typeof MODES)[number]["id"];
 type S =
@@ -48,6 +50,21 @@ export function GameApp() {
   const [pending, setPending] = useState<TrackDef | null>(null);
   const roomRef = useRef<Room | null>(null);
   const [, bump] = useState(0);
+
+  useEffect(() => {
+    const unlock = () => audio.init();
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    audio.init();
+    if (import.meta.env.DEV) (window as unknown as { __audio?: typeof audio }).__audio = audio;
+    return () => { window.removeEventListener("pointerdown", unlock); window.removeEventListener("keydown", unlock); };
+  }, []);
+
+  useEffect(() => {
+    const current = loadSettings();
+    audio.setVolumes(current.music, current.sfx);
+    audio.setScene(race && !results ? "race" : ["menu", "options", "controls"].includes(screen.id) || results ? "menu" : "selection");
+  }, [screen.id, race, results, settings]);
 
   useEffect(() => {
     setProfiles([loadProfile(0), loadProfile(1)]); setSettings(loadSettings()); setCustomTracks(loadCustomTracks());
@@ -107,6 +124,7 @@ export function GameApp() {
   const leaveRoom = async () => { const r = roomRef.current; roomRef.current = null; setRace(null); setResults(null); if (r) await r.leave(); setScreen({ id: "menu" }); };
 
   const onFinish = (rs: RaceState, result: RaceResult) => {
+    audio.play(rs.cfg.players.some((p) => p.control === "local" && p.slot === result.winner) ? "win" : "lose");
     const winner = rs.series ? recordRace(rs.series, result) : null;
     const humans = rs.cfg.players.filter((p) => p.control === "local");
     const rewards = humans.map((h) => {
@@ -182,7 +200,7 @@ export function GameApp() {
   switch (screen.id) {
     case "menu": return <MainMenu go={setScreen} />;
     case "controls": return <ControlsScreen onBack={() => { setSettings(loadSettings()); setScreen({ id: "menu" }); }} />;
-    case "options": return <Options settings={settings} onChange={(s) => { saveSettings(s); setSettings(s); }} onBack={() => setScreen({ id: "menu" })} />;
+    case "options": return <Options settings={loadSettings()} onChange={(s) => { saveSettings(s); setSettings(s); }} onBack={() => setScreen({ id: "menu" })} />;
     case "setup": return (
       <Screen title={screen.players === 2 ? "2 jogadores — escolham pilotos" : "Escolha seu piloto"} onBack={() => setScreen({ id: "menu" })} right={<Btn onClick={() => setScreen({ id: "mode", players: screen.players })}>Continuar ▶</Btn>}>
         {screen.players === 2 && <p className="mb-3 text-center text-sm text-muted-foreground">Cada jogador escolhe com o mouse o próprio piloto, veículo, cores e acessórios. Amarelo = Jogador 1 · Azul = Jogador 2.</p>}
@@ -235,8 +253,7 @@ function Options({ settings, onChange, onBack }: { settings: Settings; onChange:
   return (
     <Screen title="Opções" onBack={onBack}>
       <div className="toon-panel mx-auto max-w-md space-y-4 p-5">
-        <label className="block">Música: {Math.round(settings.music * 100)}%<input className="w-full" type="range" min={0} max={1} step={0.05} value={settings.music} onChange={(e) => onChange({ ...settings, music: Number(e.target.value) })} /></label>
-        <label className="block">Efeitos: {Math.round(settings.sfx * 100)}%<input className="w-full" type="range" min={0} max={1} step={0.05} value={settings.sfx} onChange={(e) => onChange({ ...settings, sfx: Number(e.target.value) })} /></label>
+        <SoundControls music={settings.music} effects={settings.sfx} onChange={(music, sfx) => onChange({ ...settings, music, sfx })} />
       </div>
     </Screen>
   );

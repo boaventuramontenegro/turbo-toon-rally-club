@@ -22,10 +22,10 @@ export function Btn({ tone = "primary", className, ...p }: ButtonHTMLAttributes<
 export function Screen({ title, onBack, children, right }: { title: string; onBack?: () => void; children: ReactNode; right?: ReactNode }) {
   return (
     <div className="mx-auto min-h-screen w-full max-w-6xl px-4 py-6">
-      <header className="mb-5 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3">
+      <header className="mb-5 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3 sm:grid-cols-[auto_minmax(0,1fr)_auto]">
         {onBack ? <Btn tone="muted" onClick={onBack}>← Voltar</Btn> : <span />}
-        <h1 className="truncate text-center font-display text-base text-accent sm:text-xl">{title}</h1>
-        <div className="flex gap-2">{right}</div>
+        <h1 className="min-w-0 break-words text-center font-display text-xs leading-relaxed text-accent sm:text-xl">{title}</h1>
+        {right && <div className="col-span-2 flex justify-end gap-2 sm:col-span-1">{right}</div>}
       </header>
       {children}
     </div>

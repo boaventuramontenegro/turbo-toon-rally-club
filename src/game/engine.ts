@@ -114,7 +114,7 @@ export class Race {
   }
   local(k: Kart) { return k.spec.control !== "remote"; }
   humanKarts() { return this.karts.filter((k) => k.spec.control === "local"); }
-  setPaused(p: boolean) { this.paused = p; if (p) this.keys.clear(); }
+  setPaused(p: boolean) { this.paused = p; audio.setRacePaused(p); if (p) this.keys.clear(); }
 
   private loop = (now: number) => {
     if (!this.running) return;
@@ -207,7 +207,12 @@ export class Race {
     this.checkEnd(dt);
     this.prevKeys = new Set(this.keys);
     // audio engines
-    this.karts.forEach((k, i) => audio.engineSet(i, clamp(Math.abs(k.v) / k.maxSpeed, 0, 1.3), k.boost > 0, k.ch.vehicle === "truck" ? 45 : k.ch.vehicle === "moto" ? 80 : 60));
+    const listeners = this.humanKarts();
+    this.karts.forEach((k, i) => {
+      const distance = Math.min(...listeners.map((h) => Math.hypot(h.x - k.x, h.y - k.y)));
+      const audible = k.dc || k.eliminated || k.finished ? 0 : k.spec.control === "local" ? 1 : .35 / (1 + distance / 180);
+      audio.engineSet(i, clamp(Math.abs(k.v) / k.maxSpeed, 0, 1.3), k.boost > 0, k.ch.vehicle === "truck" ? 45 : k.ch.vehicle === "moto" ? 80 : 60, k.drifting && !k.air, audible);
+    });
   }
 
   stepRemote(k: Kart, dt: number) {
@@ -468,7 +473,7 @@ export class Race {
     if (k.lap > L && !k.finished) {
       k.finished = true; k.finishTime = this.time;
       this.say(`${k.spec.name} cruzou a linha!`, PCOL[k.spec.slot] ?? "#fff");
-      audio.play(this.karts.every((o) => o === k || !o.finished) ? "win" : "lap");
+      if (k.spec.control === "local") audio.play("lap");
       this.onNet?.({ t: "fin", slot: k.spec.slot, time: k.finishTime, lapTimes: k.lapTimes, stats: k.stats });
     } else if (k.lap === L && L > 1) { this.say("VOLTA FINAL!", "#ff5a5a"); audio.play("lap"); }
     else if (k.lap > 1) audio.play("lap");
@@ -805,6 +810,7 @@ export class Race {
   }
 
   renderLight(ox: number, W: number, H: number, dpr: number, v: { x0: number; y0: number; x1: number; y1: number }) {
+    if (this.canvas.width === 0 || this.canvas.height === 0) return;
     if (!this.light) this.light = document.createElement("canvas");
     const L = this.light; if (L.width !== this.canvas.width || L.height !== this.canvas.height) { L.width = this.canvas.width; L.height = this.canvas.height; }
     const g = L.getContext("2d")!; const z = this.cam.z;

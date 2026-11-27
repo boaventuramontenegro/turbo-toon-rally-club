@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { THEMES } from "../data";
 import { Race, type NetState, type RaceConfig, type RaceResult } from "../engine";
 import { audio } from "../audio";
-import { loadSettings } from "../store";
+import { loadSettings, saveSettings } from "../store";
 import type { Room } from "../net";
 import { Btn } from "./common";
+import { SoundControls } from "./SoundControls";
 
 export function RaceView({ cfg, room, resync, onFinish, onExit, onRestart }: {
   cfg: RaceConfig; room?: Room | null; resync?: { states: NetState[] } | null;
@@ -13,6 +13,7 @@ export function RaceView({ cfg, room, resync, onFinish, onExit, onRestart }: {
   const ref = useRef<HTMLCanvasElement>(null);
   const raceRef = useRef<Race | null>(null);
   const [paused, setPaused] = useState(false);
+  const [sound, setSound] = useState(() => loadSettings());
   const [netStatus, setNetStatus] = useState<string>("");
   const finishRef = useRef(onFinish); finishRef.current = onFinish;
 
@@ -25,7 +26,7 @@ export function RaceView({ cfg, room, resync, onFinish, onExit, onRestart }: {
     if (import.meta.env.DEV) (window as unknown as { __race?: Race }).__race = race; // dev-only debug hook
     race.onFinish = (r) => finishRef.current(r);
     if (resync) race.restore(resync.states);
-    const th = THEMES[cfg.track.theme]; if (th) audio.startMusic(th.music);
+    audio.setScene("race");
     const offs: (() => void)[] = [];
     if (room) {
       race.onNet = (m) => room.send(m);
@@ -42,7 +43,7 @@ export function RaceView({ cfg, room, resync, onFinish, onExit, onRestart }: {
         else if (e.type === "status") { setNetStatus(e.status === "offline" ? "Conexão perdida — reconectando…" : e.status === "connecting" ? "Conectando…" : ""); race.peerStatus = e.status === "offline" ? "SEM CONEXÃO" : ""; }
       }));
     }
-    return () => { offs.forEach((f) => f()); race.destroy(); audio.stopMusic(); raceRef.current = null; if (room) room.getRaceSnapshot = null; };
+    return () => { offs.forEach((f) => f()); race.destroy(); raceRef.current = null; if (room) room.getRaceSnapshot = null; };
     // the race is created once per mount; parents remount with a new key for a new race
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -63,9 +64,10 @@ export function RaceView({ cfg, room, resync, onFinish, onExit, onRestart }: {
       {netStatus && <div role="status" className="toon-panel absolute left-1/2 top-20 -translate-x-1/2 bg-destructive px-4 py-2 text-sm">{netStatus}</div>}
       {paused && (
         <div className="absolute inset-0 grid place-items-center bg-black/60">
-          <div className="toon-panel w-80 space-y-3 p-6 text-center">
+          <div className="toon-panel max-h-[90dvh] w-80 max-w-[calc(100%-2rem)] space-y-3 overflow-y-auto p-6 text-center">
             <h2 className="title-toon text-xl">PAUSA</h2>
             {cfg.online && <p className="text-xs text-muted-foreground">No online a corrida continua para os outros.</p>}
+            <SoundControls music={sound.music} effects={sound.sfx} onChange={(music, sfx) => { const next = { ...sound, music, sfx }; setSound(next); saveSettings(next); audio.setVolumes(music, sfx); }} />
             <Btn className="w-full" onClick={resume}>Continuar</Btn>
             {onRestart && !cfg.online && <Btn tone="secondary" className="w-full" onClick={onRestart}>Reiniciar corrida</Btn>}
             <Btn tone="destructive" className="w-full" onClick={onExit}>{cfg.online ? "Sair da corrida" : "Sair para o menu"}</Btn>
