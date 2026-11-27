@@ -28,3 +28,12 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+
+## TURBO TOON — project rules
+- Game simulation/rendering lives in plain TS under `src/game/` (engine.ts, track.ts, modes.ts, net.ts); React UI in `src/game/ui/`. Why: rules stay testable and screens only draw state.
+- Each player's input is read only from that player's own KeyMap (`PlayerSpec.keys`); never share or split actions between players. Why: core user requirement.
+- Local 2-player races render split-screen with one camera per player (`Race.views()`). Why: each player keeps their own view and HUD.
+- Online multiplayer uses Lovable Cloud Realtime broadcast + presence on `tt-room-<CODE>` (no tables); the host simulates bots and answers `need-sync` with a snapshot for reconnecting players. Why: real-time sync without server code.
+- Settings, keymaps, profiles and saved tracks are per-device localStorage (`tt.*` keys); published tracks go to `public.community_tracks` (anon read/insert only). Why: no accounts in the game.
+- Obstacles move deterministically from race time so every client sees the same positions without syncing them.
+- Dev-only debug hook: `window.__race` (set in RaceView when `import.meta.env.DEV`) exposes the running Race for browser checks.
